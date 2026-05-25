@@ -692,6 +692,36 @@ class FastWAM(torch.nn.Module):
         return pred_action
 
     @torch.no_grad()
+    def _predict_action_noise_standalone(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict action noise using ActionDiT alone (no video expert).
+
+        Ablation method: ActionDiT runs pure self-attention + cross-attention
+        without any video KV contribution.
+        """
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens = self.mot.forward_action_only(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
+
+    @torch.no_grad()
     def _predict_action_noise_with_cache(
         self,
         latents_action: torch.Tensor,
@@ -918,12 +948,14 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        skip_video_expert: bool = False,
     ) -> dict[str, Any]:
         self.eval()
-        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
-            raise ValueError(
-                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
-            )
+        if not skip_video_expert:
+            if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
+                raise ValueError(
+                    "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
+                )
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -989,6 +1021,28 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 proprio=proprio,
             )
+
+        if skip_video_expert:
+            # Ablation: ActionDiT only, no video expert involvement.
+            logger.info("infer_action: skip_video_expert=True, running ActionDiT standalone.")
+            infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+                num_inference_steps=num_inference_steps,
+                device=self.device,
+                dtype=latents_action.dtype,
+                shift_override=sigma_shift,
+            )
+            for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+                timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+                pred_action = self._predict_action_noise_standalone(
+                    latents_action=latents_action,
+                    timestep_action=timestep_action,
+                    context=context,
+                    context_mask=context_mask,
+                )
+                latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            return {
+                "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            }
 
         timestep_video = torch.zeros(
             (first_frame_latents.shape[0],),

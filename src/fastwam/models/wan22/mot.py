@@ -340,6 +340,82 @@ class MoT(nn.Module):
             kv_cache.append({"k": k, "v": v})
         return kv_cache
 
+    def forward_action_only(
+        self,
+        action_tokens: torch.Tensor,
+        action_freqs: torch.Tensor,
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+    ) -> torch.Tensor:
+        """Run action branch with pure self-attention (no video KV).
+
+        This is the ablation variant where ActionDiT relies solely on its own
+        self-attention + cross-attention (text/proprio) without any video expert
+        contribution.
+
+        Args:
+            action_tokens: Action tokens before layer 0, shape [B, Sa, D].
+            action_freqs: Action RoPE frequencies, shape [Sa, 1, rope_dim].
+            action_t_mod: Action time modulation tensor.
+            action_context_payload: Optional dict for action cross-attention.
+                - `context`: encoder states [B, L, D]
+                - `mask`: attention mask [B, Sa, L] or [B, 1, Sa, L]
+
+        Returns:
+            Updated action tokens after all layers, shape [B, Sa, D].
+        """
+        if "action" not in self.mixtures:
+            raise ValueError("MoT requires `action` expert for `forward_action_only`.")
+
+        action_seq_len = int(action_tokens.shape[1])
+        # Pure action self-attention: all action tokens see each other.
+        action_self_mask = torch.ones(
+            (action_seq_len, action_seq_len),
+            dtype=torch.bool,
+            device=action_tokens.device,
+        )
+
+        expert = self.mixtures["action"]
+        x = action_tokens
+        for layer_idx in range(self.num_layers):
+            block = expert.blocks[layer_idx]
+            (
+                q_action,
+                k_action,
+                v_action,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=action_freqs,
+                t_mod=action_t_mod,
+            )
+            # Action-only self-attention, no video KV involved.
+            mixed = self._mixed_attention(
+                q_cat=q_action,
+                k_cat=k_action,
+                v_cat=v_action,
+                attention_mask=action_self_mask,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=action_context_payload,
+            )
+        return x
+
     def forward_action_with_video_cache(
         self,
         action_tokens: torch.Tensor,
