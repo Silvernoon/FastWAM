@@ -63,9 +63,8 @@ def run_evaluation(
     task_file: Path,
     task_choice: str,
     ckpt: str,
-    num_gpus: int,
+    gpu_id: int,
     num_trials: int,
-    max_tasks_per_gpu: int,
     output_dir: Path,
     extra_overrides: list[str],
 ) -> None:
@@ -83,9 +82,8 @@ def run_evaluation(
         {
             "CONFIG": task_choice,
             "CKPT": ckpt,
-            "NUM_GPUS": str(num_gpus),
+            "GPU_ID": str(gpu_id),
             "NUM_TRIALS": str(num_trials),
-            "MAX_TASKS_PER_GPU": str(max_tasks_per_gpu),
             "ROOT_DIR": root_dir,
             "RUN_ID": run_id,
             "OUTPUT_DIR": str(output_dir),
@@ -97,9 +95,8 @@ def run_evaluation(
     print("\nStarting evaluation (Hydra manager)...")
     print(f"task: {task_choice}")
     print(f"Checkpoint: {ckpt}")
-    print(f"Number of GPUs: {num_gpus}")
+    print(f"GPU: {gpu_id}")
     print(f"Trials per task: {num_trials}")
-    print(f"Max tasks per GPU: {max_tasks_per_gpu}")
     print(f"Output directory: {output_dir}")
     if extra_args:
         print(f"Forwarded overrides: {extra_args}")
@@ -117,11 +114,13 @@ def run_evaluation(
         failed_tasks = output_dir / "failed_tasks.txt"
         if failed_tasks.exists() and failed_tasks.stat().st_size > 0:
             print(f"Failed subtask list: {failed_tasks}")
-            print(failed_tasks.read_text(encoding='utf-8'))
+            print(failed_tasks.read_text(encoding="utf-8"))
         raise
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+@hydra.main(
+    version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml"
+)
 def main(cfg: DictConfig):
     if cfg.ckpt is None:
         raise ValueError("ckpt must not be None.")
@@ -131,7 +130,9 @@ def main(cfg: DictConfig):
     task_choice = _resolve_worker_task_choice()
     manager = cfg.MULTIRUN
 
-    output_dir = Path(os.path.expanduser(os.path.expandvars(str(cfg.EVALUATION.output_dir))))
+    output_dir = Path(
+        os.path.expanduser(os.path.expandvars(str(cfg.EVALUATION.output_dir)))
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     task_file_cfg = manager.get("task_file")
@@ -151,9 +152,8 @@ def main(cfg: DictConfig):
         task_file=task_file,
         task_choice=task_choice,
         ckpt=str(cfg.ckpt),
-        num_gpus=int(manager.num_gpus),
+        gpu_id=int(manager.get("gpu_id", 0)),
         num_trials=int(cfg.EVALUATION.num_trials),
-        max_tasks_per_gpu=int(manager.max_tasks_per_gpu),
         output_dir=output_dir,
         extra_overrides=collect_worker_overrides(),
     )

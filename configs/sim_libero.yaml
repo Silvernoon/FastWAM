@@ -48,8 +48,7 @@ MULTIRUN:
     - libero_goal
     - libero_spatial
     - libero_object
-  num_gpus: 8
-  max_tasks_per_gpu: 2
+  gpu_id: 0
 
 hydra:
   job:
