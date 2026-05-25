@@ -41,7 +41,11 @@ run_libero_eval() {
   export CONFIG
 
   mkdir -p "$OUTPUT_DIR"
-  cp "$task_list_file" "$OUTPUT_DIR/"
+  # Copy task file into output dir (skip if already there)
+  local dest="$OUTPUT_DIR/$(basename "$task_list_file")"
+  if [ "$(realpath "$task_list_file")" != "$(realpath "$dest")" ]; then
+    cp "$task_list_file" "$dest"
+  fi
 
   local TASK_LOG_DIR="$OUTPUT_DIR/task_logs"
   local FAILED_TASKS_FILE="$OUTPUT_DIR/failed_tasks.txt"
