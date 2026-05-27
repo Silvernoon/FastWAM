@@ -40,6 +40,7 @@ from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_js
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark
+import lilo_vla.benchmark  # noqa: F401 — registers LiLo suites
 from action_ensembler import ActionEnsembler
 
 OmegaConf.register_new_resolver("eval", eval)
@@ -497,6 +498,14 @@ def _get_max_steps(task_suite_name: str) -> int:
         "libero_goal": 400,
         "libero_10": 700,
         "libero_90": 700,
+        # LiLo-VLA long-horizon suites
+        "ultra_long": 1200,
+        "ultra_long_variant_1": 1200,
+        "ultra_long_variant_2": 1200,
+        "ultra_long_all": 1200,
+        "libero_long_plus_plus": 700,
+        "libero_long_plus_plus_variant": 700,
+        "libero_long_plus_plus_all": 700,
     }
     if task_suite_name not in suite_steps:
         raise ValueError(f"Unknown task suite: {task_suite_name}")

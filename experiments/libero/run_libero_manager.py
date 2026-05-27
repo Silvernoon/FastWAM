@@ -7,6 +7,7 @@ from pathlib import Path
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from libero.libero import benchmark
+import lilo_vla.benchmark  # noqa: F401 — registers LiLo suites
 from omegaconf import DictConfig, OmegaConf
 
 

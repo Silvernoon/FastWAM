@@ -48,6 +48,8 @@ MULTIRUN:
     - libero_goal
     - libero_spatial
     - libero_object
+    - libero_long_plus_plus
+    - ultra_long
   gpu_id: 0
 
 hydra:
