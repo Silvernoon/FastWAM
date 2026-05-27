@@ -87,7 +87,7 @@ v_cat = torch.cat([gate * v_video, v_action], dim=1)
 
 训练后检查 gate 值——如果大部分层 gate → 0，就验证了你的假设。
 
-## 思路
+# 思路1
 
 AtionDiT实际上已经学会了世界变化吗，因为它是从VideoDiT改的
 
@@ -98,5 +98,40 @@ AtionDiT实际上已经学会了世界变化吗，因为它是从VideoDiT改的
 那为什么数据差一点
 
 是不是attention的问题，videoDiT提交一次影响了attention
+
+## no
+
+当 `skip_video_expert=True` 时，**图片根本没进入 ActionDiT**。正常流程中，图片是先通过 VAE 编码成 latent → Video DiT pre_dit → prefill video KV cache → 混合 attention 传给 action tokens。跳过 video expert 后，action 只拿到了 text context（任务描述）和 proprio，完全没有视觉信息，所以机器人找不到物品是预期行为。
+
+这也恰好**否定了**你笔记里的假设——ActionDiT 并没有"自己就能理解未来"，它的世界理解能力完全依赖于 video expert 通过混合 attention 注入的视觉表征。
+
+你的 skip_video 实验其实验证了一个重要结论：**ActionDiT 的能力并非来自"继承了 VideoDiT 的世界模型"**，而是运行时通过混合 attention 从 video expert 实时获取视觉理解。backbone 初始化只是给了一个好的起点（text/time embedding 对齐、DiT block 结构预训练），但视觉感知能力完全是通过 video KV 在推理时注入的。
+
+## 为什么用 VideoDiT 初始化 ActionDiT
+
+ActionDiT **并不是直接复制** VideoDiT 的权重——hidden_dim 从 3072 缩到 1024，形状都不一样。preprocess 脚本做的是：
+
+1. 逐 key 对比 video_state 和 action_state 的 shape
+2. shape 相同的直接 copy（比如 `num_heads=24, attn_head_dim=128` 相关的 norm 参数）
+3. shape 不同的用 **1D linear interpolation** 把 3072 维的权重压缩到 1024 维，再乘一个 alpha 缩放因子 `sqrt(3072/1024) ≈ 1.73`
+
+```python
+value = _resize_tensor_to_shape(src, tuple(target.shape))
+if apply_alpha_scaling and src.ndim >= 2 and src.shape[-1] != target.shape[-1]:
+    alpha = (float(src.shape[-1]) / float(target.shape[-1])) ** 0.5
+    value = value.to(torch.float32) * alpha
+```
+
+## 这么做的目的
+
+不是为了让 ActionDiT "继承世界理解能力"，而是为了获得一个**更好的优化起点**：
+
+1. **DiT block 的结构性知识** — 30 层 transformer 从随机初始化训练很难收敛，用预训练的 VideoDiT 权重（即使 interpolated）至少让 attention pattern、残差路径、layernorm 的统计量处于合理区间
+2. **text/time embedding 对齐** — text_dim=4096, freq_dim=256, num_heads=24, attn_head_dim=128 这些和 video expert 完全一致，对应的 embedding 层权重可以直接复制，使得 action expert 的 cross-attention 一开始就能正确读取 text context
+3. **MoT 混合 attention 的兼容性** — 两个 expert 拼在一起做 attention，如果 action expert 是纯随机的，早期梯度会很混乱，video tokens attend 到的 action K/V 全是噪声
+
+本质上就是**迁移学习**——用 5B 模型的知识蒸馏出一个 1.1B 的 action 分支的初始化，然后靠后续 fine-tune 让它学会 action-specific 的东西。你的 skip_video 实验证明了：这个初始化确实不够让 ActionDiT 独立工作，它在推理时仍然完全依赖 video KV 注入的视觉信息。
+
+## 思路2,全闭环运算
 
 
