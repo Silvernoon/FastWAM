@@ -27,6 +27,15 @@ EVALUATION:
   use_action_ensembler: false
   visualize_future_video: false
 
+  # Multi-frame observation history (set > 1 to use infer_action_multiframe)
+  # N should satisfy (N-1) % 4 == 0 for VAE compatibility (e.g. 1, 5, 9)
+  num_obs_history: 1
+
+  # Video attention scale: controls how strongly video KV cache influences
+  # action denoising. Values < 1.0 reduce visual over-reliance.
+  # Set via model constructor or override at runtime.
+  # video_attn_scale: 0.7
+
   # Action inference
   action_horizon: null
   num_inference_steps: ${eval_num_inference_steps}

@@ -57,6 +57,15 @@ train:
 
     train_transforms:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: fastwam.datasets.lerobot.transforms.image.TemporalConsistentColorJitter
+        brightness: 0.1
+        contrast: 0.1
+        saturation: 0.1
+        hue: 0.02
+        p: 0.5
+      - _target_: fastwam.datasets.lerobot.transforms.image.TemporalConsistentGaussianNoise
+        std: 0.02
+        p: 0.3
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
     val_transforms:

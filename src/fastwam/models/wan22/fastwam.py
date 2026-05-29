@@ -40,6 +40,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        video_attn_scale: float = 1.0,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -86,6 +87,7 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.video_attn_scale = float(video_attn_scale)
 
         self.to(self.device)
 
@@ -266,6 +268,37 @@ class FastWAM(torch.nn.Module):
             z = z[0].unsqueeze(0)
         return z
 
+    @torch.no_grad()
+    def _encode_multi_frame_latents_tensor(
+        self,
+        frames: torch.Tensor,
+        tiled: bool = False,
+        tile_size: tuple = (30, 52),
+        tile_stride: tuple = (15, 26),
+    ) -> torch.Tensor:
+        """Encode multiple observation frames into a single latent tensor.
+
+        Args:
+            frames: Tensor of shape [N, 3, H, W] where N is the number of
+                observation frames (most recent last). Values in [-1, 1].
+            tiled: Whether to use tiled encoding for large resolutions.
+
+        Returns:
+            Latent tensor of shape [1, C, T_latent, h, w] suitable for
+            video expert prefill. T_latent depends on VAE temporal
+            downsampling (T_latent = 1 + (N-1)//4 for standard VAE).
+        """
+        if frames.ndim != 4 or frames.shape[1] != 3:
+            raise ValueError(
+                f"`frames` must have shape [N, 3, H, W], got {tuple(frames.shape)}"
+            )
+        # VAE expects [C, T, H, W] per sample in a list
+        video = frames.permute(1, 0, 2, 3).to(device=self.device)  # [3, N, H, W]
+        z = self.vae.encode([video], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        if isinstance(z, list):
+            z = z[0].unsqueeze(0)
+        return z
+
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
@@ -391,6 +424,7 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        action_attends_all_video_frames: bool = False,
     ) -> torch.Tensor:
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
@@ -403,9 +437,12 @@ class FastWAM(torch.nn.Module):
         )
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
-        # action -> first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        # action -> video: either first-frame only or all frames
+        if action_attends_all_video_frames:
+            mask[video_seq_len:, :video_seq_len] = True
+        else:
+            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
+            mask[video_seq_len:, :first_frame_tokens] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -834,6 +871,9 @@ class FastWAM(torch.nn.Module):
             "context": context_emb,
             "mask": context_attn_mask,
         }
+        # Apply video attention scaling to reduce over-reliance on visual conditioning
+        if self.video_attn_scale != 1.0:
+            video_cache_v = [v * self.video_attn_scale for v in video_cache_v]
         tokens = self.mot._forward_action_with_video_cache_inner(
             action_tokens=tokens,
             action_freqs=action_freqs,
@@ -1216,6 +1256,173 @@ class FastWAM(torch.nn.Module):
 
         nvtx.range_pop()  # action_denoise_loop
         nvtx.range_pop()  # infer_action
+        return {
+            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+        }
+
+    @torch.no_grad()
+    def infer_action_multiframe(
+        self,
+        prompt: Optional[str],
+        input_frames: torch.Tensor,
+        action_horizon: int,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        """Infer actions conditioned on multiple observation frames.
+
+        Unlike `infer_action` which takes a single frame [1,3,H,W], this method
+        accepts multiple frames [N,3,H,W] (most recent last). The VAE encodes
+        them as a short video clip, and the action expert attends to ALL video
+        frame tokens (not just the first frame).
+
+        This provides richer temporal context and reduces over-reliance on a
+        single observation frame.
+
+        Args:
+            input_frames: Tensor of shape [N, 3, H, W] with N observation frames
+                in temporal order (oldest first, newest last). Values in [-1, 1].
+                N should satisfy (N-1) % 4 == 0 for VAE compatibility (e.g. 1, 5, 9).
+            Other args: same as `infer_action`.
+        """
+        self.eval()
+
+        if input_frames.ndim == 3:
+            input_frames = input_frames.unsqueeze(0)
+        if input_frames.ndim != 4 or input_frames.shape[1] != 3:
+            raise ValueError(
+                f"`input_frames` must have shape [N,3,H,W], got {tuple(input_frames.shape)}"
+            )
+        num_obs_frames = input_frames.shape[0]
+        _, _, height, width = input_frames.shape
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"`input_frames` spatial dims must be multiples of 16, got HxW=({height},{width})"
+            )
+
+        if proprio is not None:
+            if self.proprio_dim is None:
+                raise ValueError("`proprio` was provided but `proprio_dim=None`.")
+            if proprio.ndim == 1:
+                proprio = proprio.unsqueeze(0)
+            elif proprio.ndim == 2 and proprio.shape[0] == 1:
+                pass
+            else:
+                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+            if proprio.shape[1] != self.proprio_dim:
+                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
+            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
+
+        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        latents_action = torch.randn(
+            (1, action_horizon, self.action_expert.action_dim),
+            generator=generator,
+            device=rand_device,
+            dtype=torch.float32,
+        ).to(device=self.device, dtype=self.torch_dtype)
+
+        input_frames = input_frames.to(device=self.device, dtype=self.torch_dtype)
+        # Encode multiple frames as a video clip
+        first_frame_latents = self._encode_multi_frame_latents_tensor(
+            frames=input_frames, tiled=tiled
+        )
+        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
+
+        # Resolve text context
+        use_prompt = prompt is not None
+        use_context = context is not None or context_mask is not None
+        if use_prompt and use_context:
+            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+        if not use_prompt and not use_context:
+            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
+
+        if use_prompt:
+            context, context_mask = self.encode_prompt(prompt)
+        else:
+            if context is None or context_mask is None:
+                raise ValueError("`context` and `context_mask` must be both provided together.")
+            if context.ndim == 2:
+                context = context.unsqueeze(0)
+            if context_mask.ndim == 1:
+                context_mask = context_mask.unsqueeze(0)
+            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+
+        if proprio is not None:
+            context, context_mask = self._append_proprio_to_context(
+                context=context, context_mask=context_mask, proprio=proprio,
+            )
+
+        # Video expert prefill with multi-frame latents
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+
+        # Build attention mask: action attends to ALL video frames
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+            action_attends_all_video_frames=True,
+        )
+
+        # Prefill video cache
+        video_attention_mask_slice = attention_mask[:video_seq_len, :video_seq_len]
+        cache_k_list, cache_v_list = self._prefill_step_compiled(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context=video_pre["context"],
+            video_context_mask=video_pre["context_mask"],
+            video_attention_mask=video_attention_mask_slice,
+        )
+
+        # Action denoising loop
+        action_seq_len = latents_action.shape[1]
+        action_freqs = self.action_expert.freqs[:action_seq_len].view(action_seq_len, 1, -1).to(latents_action.device)
+        total_seq_len = video_seq_len + action_seq_len
+        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+
+        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=num_inference_steps,
+            device=self.device,
+            dtype=latents_action.dtype,
+            shift_override=sigma_shift,
+        )
+        for step_idx, (step_t_action, step_delta_action) in enumerate(zip(infer_timesteps_action, infer_deltas_action)):
+            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+            pred_action = self._denoise_step_compiled(
+                latents_action=latents_action,
+                timestep_action=timestep_action,
+                context=context,
+                context_mask=context_mask,
+                video_cache_k=cache_k_list,
+                video_cache_v=cache_v_list,
+                action_attention_mask=action_attention_mask,
+                action_freqs=action_freqs,
+            )
+            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
